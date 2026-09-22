@@ -1,0 +1,589 @@
+/* ============================================================
+   0. Очистка старых VIEW
+   ============================================================ */
+
+DROP VIEW IF EXISTS v_final_table;
+DROP VIEW IF EXISTS v_segment_metrics;
+DROP VIEW IF EXISTS v_pvz_efficiency;
+DROP VIEW IF EXISTS v_pvz_costs;
+DROP VIEW IF EXISTS v_client_pvz_incrementality;
+DROP VIEW IF EXISTS v_client_incrementality_total;
+DROP VIEW IF EXISTS v_client_total_new_pvz_gmv;
+DROP VIEW IF EXISTS v_client_new_pvz_gmv;
+DROP VIEW IF EXISTS v_client_behavior;
+DROP VIEW IF EXISTS v_analysis_dates;
+DROP VIEW IF EXISTS v_client_classification;
+DROP VIEW IF EXISTS v_client_context;
+DROP VIEW IF EXISTS v_client_first_any_new_pvz;
+DROP VIEW IF EXISTS v_client_first_order;
+DROP VIEW IF EXISTS v_orders_adjusted;
+
+
+/* ============================================================
+   1. Заказы с корректировкой дат для новых ПВЗ
+
+   Если заказ в новом ПВЗ был раньше open_date,
+   не удаляем его, но для хронологии считаем датой open_date.
+   ============================================================ */
+
+CREATE VIEW v_orders_adjusted AS
+SELECT
+    o.order_id,
+    o.client_id,
+    date(o.order_date) AS raw_order_date,
+
+    CASE
+        WHEN p.pvz_id IS NOT NULL
+             AND date(o.order_date) < date(p.open_date)
+        THEN date(p.open_date)
+        ELSE date(o.order_date)
+    END AS adjusted_order_date,
+
+    o.pvz_id,
+    o.gmv,
+
+    p.open_date,
+    CASE
+        WHEN p.pvz_id IS NOT NULL THEN 1
+        ELSE 0
+    END AS is_new_pvz
+
+FROM Orders o
+LEFT JOIN PVZ_New p
+    ON o.pvz_id = p.pvz_id;
+
+
+/* ============================================================
+   2. Первый заказ клиента в компании
+   ============================================================ */
+
+CREATE VIEW v_client_first_order AS
+WITH ranked_orders AS (
+    SELECT
+        client_id,
+        order_id,
+        adjusted_order_date,
+        raw_order_date,
+        pvz_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY client_id
+            ORDER BY adjusted_order_date, raw_order_date, order_id
+        ) AS rn
+    FROM v_orders_adjusted
+)
+SELECT
+    client_id,
+    adjusted_order_date AS first_order_date,
+    pvz_id AS first_pvz_id
+FROM ranked_orders
+WHERE rn = 1;
+
+
+/* ============================================================
+   3. Первый заказ клиента в любом новом ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_client_first_any_new_pvz AS
+WITH ranked_new_orders AS (
+    SELECT
+        client_id,
+        order_id,
+        adjusted_order_date,
+        raw_order_date,
+        pvz_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY client_id
+            ORDER BY adjusted_order_date, raw_order_date, order_id
+        ) AS rn
+    FROM v_orders_adjusted
+    WHERE is_new_pvz = 1
+)
+SELECT
+    client_id,
+    adjusted_order_date AS first_new_pvz_order_date,
+    pvz_id AS first_new_pvz_id
+FROM ranked_new_orders
+WHERE rn = 1;
+
+
+/* ============================================================
+   4. Контекст клиента перед первым заказом в новом ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_client_context AS
+SELECT
+    n.client_id,
+    n.first_new_pvz_order_date,
+    n.first_new_pvz_id,
+
+    f.first_order_date,
+    f.first_pvz_id,
+
+    (
+        SELECT MAX(o.adjusted_order_date)
+        FROM v_orders_adjusted o
+        WHERE o.client_id = n.client_id
+          AND date(o.adjusted_order_date) < date(n.first_new_pvz_order_date)
+    ) AS last_order_before_new_pvz
+
+FROM v_client_first_any_new_pvz n
+JOIN v_client_first_order f
+    ON n.client_id = f.client_id;
+
+
+/* ============================================================
+   5. Классификация клиентов
+   ============================================================ */
+
+CREATE VIEW v_client_classification AS
+SELECT
+    *,
+
+    CASE
+        WHEN first_order_date = first_new_pvz_order_date
+             AND first_pvz_id = first_new_pvz_id
+        THEN 'new_client'
+
+        WHEN last_order_before_new_pvz IS NOT NULL
+             AND julianday(first_new_pvz_order_date) - julianday(last_order_before_new_pvz) > 90
+        THEN 'reactivated_client'
+
+        ELSE 'existing_active_client'
+    END AS client_type,
+
+    CASE
+        WHEN last_order_before_new_pvz IS NULL THEN NULL
+        ELSE julianday(first_new_pvz_order_date) - julianday(last_order_before_new_pvz)
+    END AS gap_days
+
+FROM v_client_context;
+
+
+/* ============================================================
+   6. Максимальная дата данных
+   ============================================================ */
+
+CREATE VIEW v_analysis_dates AS
+SELECT
+    MAX(adjusted_order_date) AS max_order_date
+FROM v_orders_adjusted;
+
+
+/* ============================================================
+   7. Поведение клиента до/после первого заказа в новом ПВЗ
+
+   baseline = 90 дней до первого заказа в новом ПВЗ
+   post = период от первого заказа в новом ПВЗ до конца данных
+   ============================================================ */
+
+CREATE VIEW v_client_behavior AS
+SELECT
+    c.client_id,
+    c.client_type,
+    c.first_new_pvz_order_date,
+    c.first_new_pvz_id,
+    c.last_order_before_new_pvz,
+    c.gap_days,
+
+    COALESCE(SUM(
+        CASE
+            WHEN date(o.adjusted_order_date) >= date(c.first_new_pvz_order_date, '-90 day')
+             AND date(o.adjusted_order_date) <  date(c.first_new_pvz_order_date)
+            THEN o.gmv
+            ELSE 0
+        END
+    ), 0) AS baseline_company_gmv_90d,
+
+    COALESCE(SUM(
+        CASE
+            WHEN date(o.adjusted_order_date) >= date(c.first_new_pvz_order_date)
+             AND date(o.adjusted_order_date) <= date(a.max_order_date)
+            THEN o.gmv
+            ELSE 0
+        END
+    ), 0) AS post_company_gmv_total,
+
+    MAX(
+        1,
+        julianday(a.max_order_date) - julianday(c.first_new_pvz_order_date) + 1
+    ) AS post_days
+
+FROM v_client_classification c
+CROSS JOIN v_analysis_dates a
+LEFT JOIN v_orders_adjusted o
+    ON o.client_id = c.client_id
+
+GROUP BY
+    c.client_id,
+    c.client_type,
+    c.first_new_pvz_order_date,
+    c.first_new_pvz_id,
+    c.last_order_before_new_pvz,
+    c.gap_days,
+    a.max_order_date;
+
+
+/* ============================================================
+   8. GMV клиента в каждом новом ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_client_new_pvz_gmv AS
+SELECT
+    o.client_id,
+    o.pvz_id AS new_pvz_id,
+    SUM(o.gmv) AS client_new_pvz_gmv
+FROM v_orders_adjusted o
+JOIN v_client_classification c
+    ON o.client_id = c.client_id
+WHERE o.is_new_pvz = 1
+  AND date(o.adjusted_order_date) >= date(c.first_new_pvz_order_date)
+GROUP BY
+    o.client_id,
+    o.pvz_id;
+
+
+/* ============================================================
+   9. Общий GMV клиента во всех новых ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_client_total_new_pvz_gmv AS
+SELECT
+    client_id,
+    SUM(client_new_pvz_gmv) AS total_new_pvz_gmv
+FROM v_client_new_pvz_gmv
+GROUP BY client_id;
+
+
+/* ============================================================
+   10. Инкрементальный GMV на уровне клиента
+   ============================================================ */
+
+CREATE VIEW v_client_incrementality_total AS
+WITH base AS (
+    SELECT
+        b.client_id,
+        b.client_type,
+        b.baseline_company_gmv_90d,
+        b.post_company_gmv_total,
+        b.post_days,
+        t.total_new_pvz_gmv,
+
+        b.baseline_company_gmv_90d * b.post_days / 90.0
+            AS expected_company_gmv_post_period,
+
+        b.post_company_gmv_total
+        - b.baseline_company_gmv_90d * b.post_days / 90.0
+            AS company_gmv_uplift
+
+    FROM v_client_behavior b
+    JOIN v_client_total_new_pvz_gmv t
+        ON b.client_id = t.client_id
+)
+SELECT
+    client_id,
+    client_type,
+    total_new_pvz_gmv,
+    baseline_company_gmv_90d,
+    post_company_gmv_total,
+    post_days,
+    expected_company_gmv_post_period,
+    company_gmv_uplift,
+
+    CASE
+        WHEN client_type = 'new_client'
+        THEN total_new_pvz_gmv
+
+        WHEN client_type = 'reactivated_client'
+        THEN total_new_pvz_gmv * 0.5
+
+        WHEN client_type = 'existing_active_client'
+             AND company_gmv_uplift <= 0
+        THEN 0
+
+        WHEN client_type = 'existing_active_client'
+             AND company_gmv_uplift > total_new_pvz_gmv
+        THEN total_new_pvz_gmv
+
+        WHEN client_type = 'existing_active_client'
+        THEN company_gmv_uplift
+
+        ELSE 0
+    END AS incremental_gmv_total
+
+FROM base;
+
+
+/* ============================================================
+   11. Распределение incremental GMV клиента между новыми ПВЗ
+
+   Если клиент покупал в нескольких новых ПВЗ,
+   incremental GMV распределяется пропорционально GMV в каждом ПВЗ.
+   ============================================================ */
+
+CREATE VIEW v_client_pvz_incrementality AS
+SELECT
+    g.client_id,
+    g.new_pvz_id,
+    i.client_type,
+
+    g.client_new_pvz_gmv AS total_new_pvz_gmv,
+
+    i.incremental_gmv_total
+    * g.client_new_pvz_gmv
+    / NULLIF(i.total_new_pvz_gmv, 0) AS incremental_gmv,
+
+    g.client_new_pvz_gmv
+    -
+    (
+        i.incremental_gmv_total
+        * g.client_new_pvz_gmv
+        / NULLIF(i.total_new_pvz_gmv, 0)
+    ) AS non_incremental_gmv
+
+FROM v_client_new_pvz_gmv g
+JOIN v_client_incrementality_total i
+    ON g.client_id = i.client_id;
+
+
+/* ============================================================
+   12. CAPEX, OPEX и active_months по каждому ПВЗ
+
+   active_months считаем через MAX(age_month),
+   а не через COUNT(month), потому что PVZ_Monthly содержит строки
+   за все месяцы 2025, включая месяцы до открытия.
+   ============================================================ */
+
+CREATE VIEW v_pvz_costs AS
+SELECT
+    p.pvz_id,
+    p.city,
+    p.region,
+    p.population,
+    p.location_segment,
+    p.investment_cost,
+
+    COALESCE(SUM(m.support_cost), 0) AS support_cost_total,
+
+    COALESCE(MAX(m.age_month), 0) AS active_months
+
+FROM PVZ_New p
+LEFT JOIN PVZ_Monthly m
+    ON p.pvz_id = m.pvz_id
+
+GROUP BY
+    p.pvz_id,
+    p.city,
+    p.region,
+    p.population,
+    p.location_segment,
+    p.investment_cost;
+
+
+/* ============================================================
+   13. Метрики на уровне ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_pvz_efficiency AS
+SELECT
+    c.pvz_id,
+    c.city,
+    c.region,
+    c.population,
+    c.location_segment,
+    c.investment_cost,
+    c.support_cost_total,
+    c.active_months,
+
+    COALESCE(SUM(i.total_new_pvz_gmv), 0) AS total_gmv,
+    COALESCE(SUM(i.incremental_gmv), 0) AS incremental_gmv,
+    COALESCE(SUM(i.non_incremental_gmv), 0) AS non_incremental_gmv,
+
+    COALESCE(SUM(i.incremental_gmv), 0) * 1.0
+        / NULLIF(COALESCE(SUM(i.total_new_pvz_gmv), 0), 0)
+        AS observed_incremental_share,
+
+    COALESCE(SUM(i.incremental_gmv), 0) * 12.0
+        / NULLIF(c.active_months, 0)
+        AS annualized_incremental_gmv,
+
+    COALESCE(SUM(i.total_new_pvz_gmv), 0) * 12.0
+        / NULLIF(c.active_months, 0)
+        AS annualized_total_gmv,
+
+    COALESCE(SUM(i.incremental_gmv), 0) * 1.0
+        / NULLIF(c.active_months, 0)
+        AS avg_monthly_incremental_gmv,
+
+    c.support_cost_total * 1.0
+        / NULLIF(c.active_months, 0)
+        AS avg_monthly_support_cost
+
+FROM v_pvz_costs c
+LEFT JOIN v_client_pvz_incrementality i
+    ON c.pvz_id = i.new_pvz_id
+
+GROUP BY
+    c.pvz_id,
+    c.city,
+    c.region,
+    c.population,
+    c.location_segment,
+    c.investment_cost,
+    c.support_cost_total,
+    c.active_months;
+
+
+/* ============================================================
+   14. Метрики по типам ПВЗ
+   ============================================================ */
+
+CREATE VIEW v_segment_metrics AS
+SELECT
+    location_segment,
+
+    COUNT(DISTINCT pvz_id) AS pvz_count,
+
+    SUM(incremental_gmv) / 1000000.0
+        AS actual_incremental_gmv_mln,
+
+    SUM(annualized_incremental_gmv) / 1000000.0
+        AS annualized_incremental_gmv_mln,
+
+    SUM(annualized_incremental_gmv) * 1.0
+        / NULLIF(SUM(annualized_total_gmv), 0)
+        AS normalized_incremental_share,
+
+    SUM(annualized_incremental_gmv) * 1.0
+        / NULLIF(SUM(investment_cost), 0)
+        AS capex_efficiency_per_rub,
+
+    SUM(avg_monthly_incremental_gmv) * 1.0
+        / NULLIF(SUM(avg_monthly_support_cost), 0)
+        AS opex_efficiency_per_rub
+
+FROM v_pvz_efficiency
+
+GROUP BY location_segment;
+
+
+/* ============================================================
+   15. Финальная таблица для слайда
+   ============================================================ */
+
+CREATE VIEW v_final_table AS
+
+SELECT
+    'Фактический инкрементальный GMV, млн руб.' AS "Тип ПВЗ",
+
+    ROUND(MAX(CASE WHEN location_segment = 'small_city_center'
+        THEN actual_incremental_gmv_mln END), 2) AS "Центр малого города",
+
+    ROUND(MAX(CASE WHEN location_segment = 'suburb'
+        THEN actual_incremental_gmv_mln END), 2) AS "Пригород",
+
+    ROUND(MAX(CASE WHEN location_segment = 'new_residential_complex'
+        THEN actual_incremental_gmv_mln END), 2) AS "Новый ЖК",
+
+    ROUND(MAX(CASE WHEN location_segment = 'business_district'
+        THEN actual_incremental_gmv_mln END), 2) AS "Деловой район",
+
+    ROUND(MAX(CASE WHEN location_segment = 'dense_residential'
+        THEN actual_incremental_gmv_mln END), 2) AS "Плотная жилая застройка"
+
+FROM v_segment_metrics
+
+UNION ALL
+
+SELECT
+    'Годовой инкрементальный GMV, млн руб.*' AS "Тип ПВЗ",
+
+    ROUND(MAX(CASE WHEN location_segment = 'small_city_center'
+        THEN annualized_incremental_gmv_mln END), 2) AS "Центр малого города",
+
+    ROUND(MAX(CASE WHEN location_segment = 'suburb'
+        THEN annualized_incremental_gmv_mln END), 2) AS "Пригород",
+
+    ROUND(MAX(CASE WHEN location_segment = 'new_residential_complex'
+        THEN annualized_incremental_gmv_mln END), 2) AS "Новый ЖК",
+
+    ROUND(MAX(CASE WHEN location_segment = 'business_district'
+        THEN annualized_incremental_gmv_mln END), 2) AS "Деловой район",
+
+    ROUND(MAX(CASE WHEN location_segment = 'dense_residential'
+        THEN annualized_incremental_gmv_mln END), 2) AS "Плотная жилая застройка"
+
+FROM v_segment_metrics
+
+UNION ALL
+
+SELECT
+    'Нормализованная доля инкрементального GMV, %**' AS "Тип ПВЗ",
+
+    ROUND(MAX(CASE WHEN location_segment = 'small_city_center'
+        THEN normalized_incremental_share END) * 100.0, 1) AS "Центр малого города",
+
+    ROUND(MAX(CASE WHEN location_segment = 'suburb'
+        THEN normalized_incremental_share END) * 100.0, 1) AS "Пригород",
+
+    ROUND(MAX(CASE WHEN location_segment = 'new_residential_complex'
+        THEN normalized_incremental_share END) * 100.0, 1) AS "Новый ЖК",
+
+    ROUND(MAX(CASE WHEN location_segment = 'business_district'
+        THEN normalized_incremental_share END) * 100.0, 1) AS "Деловой район",
+
+    ROUND(MAX(CASE WHEN location_segment = 'dense_residential'
+        THEN normalized_incremental_share END) * 100.0, 1) AS "Плотная жилая застройка"
+
+FROM v_segment_metrics
+
+UNION ALL
+
+SELECT
+    'CAPEX-эффективность на 1 ₽ затрат, руб.' AS "Тип ПВЗ",
+
+    ROUND(MAX(CASE WHEN location_segment = 'small_city_center'
+        THEN capex_efficiency_per_rub END), 2) AS "Центр малого города",
+
+    ROUND(MAX(CASE WHEN location_segment = 'suburb'
+        THEN capex_efficiency_per_rub END), 2) AS "Пригород",
+
+    ROUND(MAX(CASE WHEN location_segment = 'new_residential_complex'
+        THEN capex_efficiency_per_rub END), 2) AS "Новый ЖК",
+
+    ROUND(MAX(CASE WHEN location_segment = 'business_district'
+        THEN capex_efficiency_per_rub END), 2) AS "Деловой район",
+
+    ROUND(MAX(CASE WHEN location_segment = 'dense_residential'
+        THEN capex_efficiency_per_rub END), 2) AS "Плотная жилая застройка"
+
+FROM v_segment_metrics
+
+UNION ALL
+
+SELECT
+    'OPEX-эффективность на 1 ₽ затрат, руб.' AS "Тип ПВЗ",
+
+    ROUND(MAX(CASE WHEN location_segment = 'small_city_center'
+        THEN opex_efficiency_per_rub END), 2) AS "Центр малого города",
+
+    ROUND(MAX(CASE WHEN location_segment = 'suburb'
+        THEN opex_efficiency_per_rub END), 2) AS "Пригород",
+
+    ROUND(MAX(CASE WHEN location_segment = 'new_residential_complex'
+        THEN opex_efficiency_per_rub END), 2) AS "Новый ЖК",
+
+    ROUND(MAX(CASE WHEN location_segment = 'business_district'
+        THEN opex_efficiency_per_rub END), 2) AS "Деловой район",
+
+    ROUND(MAX(CASE WHEN location_segment = 'dense_residential'
+        THEN opex_efficiency_per_rub END), 2) AS "Плотная жилая застройка"
+
+FROM v_segment_metrics;
+
+
+/* ============================================================
+   16. Вывод финальной таблицы
+   ============================================================ */
+
+SELECT *
+FROM v_final_table;
